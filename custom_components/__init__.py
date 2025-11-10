@@ -1,0 +1,1 @@
+"""eKartoteka sensor"""
