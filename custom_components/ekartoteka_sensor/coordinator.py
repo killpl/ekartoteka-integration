@@ -32,14 +32,18 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 
 # Default polling cadence for the coordinator
 SCAN_INTERVAL = timedelta(hours=24)
+# Polling cadence after a failed update, until the next successful one
+RETRY_INTERVAL = timedelta(minutes=30)
 
 class EkartotekaCoordinator(DataUpdateCoordinator[dict]):
     """Coordinator fetching data for a single house.
 
     coordinator.data schema:
     {
-        "invoice_summary": dict
+        "meters_invoice_summary": dict
         "meters": dict
+        "sensors": list
+        "last_invoice": dict
         "meta": { "house_id": int, "house_name": str }
     }
     """
@@ -78,14 +82,14 @@ class EkartotekaCoordinator(DataUpdateCoordinator[dict]):
             for apt in apartment_list:
                 apt_id = apt.get("IdLok")
                 if apt_id is None:
-                    _LOGGER.warning("Empty IdLok in", apartment_list)
+                    _LOGGER.warning("Empty IdLok in %s", apt)
                     continue
                 
                 # Iterate over sensors
                 for s in sensors:
                     sensor_id = s.get("id_el_op")
                     if sensor_id is None:
-                        _LOGGER.warning("Empty sensor ", sensor_id, "in", s)
+                        _LOGGER.warning("Empty sensor id in %s", s)
                         continue
                     # per original API shape: houseSensorValue(apartment_id, sensor_id)
                     values = await self.hass.async_add_executor_job(
@@ -126,11 +130,9 @@ class EkartotekaCoordinator(DataUpdateCoordinator[dict]):
                 )
                 if inv_list:
                     for inv in inv_list:
-                        _LOGGER.error(inv)
                         sensor_cost = await self.hass.async_add_executor_job(
                             self.api.houseSensorCost, self.house_id, inv["id_el_op"]
                         )
-                        _LOGGER.error(sensor_cost)
                         if sensor_cost:
                             inv["cost"] = sensor_cost[0]["zuzycieFaktyczne"]
                             inv["amount"] = sensor_cost[0]["zuzycieFaktyczneJM"]
@@ -142,14 +144,23 @@ class EkartotekaCoordinator(DataUpdateCoordinator[dict]):
                     "Invoice summary failed for house %s: %s", self.house_id, inv_err
                 )
 
-            return {
+            data = {
                 "meters_invoice_summary": meters_invoice_summary,
                 "meters": meters,
+                "sensors": sensors,
                 "meta": {"house_id": self.house_id, "house_name": self.house_name},
                 "last_invoice": last_invoice
             }
 
         except Exception as err:
-            _LOGGER.error(traceback.format_exc())
-            raise UpdateFailed(f"Unable to update eKartoteka data: {err}") from err
+            _LOGGER.debug(traceback.format_exc())
+            # Don't wait a whole SCAN_INTERVAL after a transient failure
+            self.update_interval = RETRY_INTERVAL
+            raise UpdateFailed(
+                f"Unable to update eKartoteka data for house {self.house_id} "
+                f"(retrying in {RETRY_INTERVAL}): {err}"
+            ) from err
+
+        self.update_interval = SCAN_INTERVAL
+        return data
 

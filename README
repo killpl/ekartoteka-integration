@@ -26,7 +26,7 @@ It is recommended to confiure the sensor through the UI.
 
 The sensor uses API from https://www.e-kartoteka.pl/#/login.
 
-The data is refreshed every 24 hours or on the sensor startup.
+The data is refreshed every 24 hours or on the sensor startup. If an update fails, it is retried every 30 minutes until it succeeds; transient network errors and 429/5xx responses are retried automatically with backoff.
 The sensors are not updated if the data hasn't changed.
 
 # Legal notice

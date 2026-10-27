@@ -11,7 +11,6 @@ per house to minimize load and keep entities in sync.
 from __future__ import annotations
 
 import logging
-import traceback
 from datetime import timedelta
 from typing import Callable, Optional
 
@@ -27,9 +26,10 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .ekartoteka_api import eKartotekaAPI
+from .ekartoteka_api import eKartotekaAPI, eKartotekaAuthError
 from .meter_sensor import EkartotekaMeterSensor
 from .invoice_entry_sensor import EkartotekaRentInvoiceEntry
 from .meter_sensor_cost import EkartotekaMeterSensorCost
@@ -54,74 +54,104 @@ SCAN_INTERVAL = timedelta(hours=24)
 async def _async_build_entities_for_house(
     hass: HomeAssistant, api: eKartotekaAPI, house: dict
 ) -> list[SensorEntity]:
+    """Create entities for a house.
+
+    Raises PlatformNotReady when the first refresh fails, so Home Assistant
+    retries the setup instead of silently ending up with no entities.
+    """
     entities: list[SensorEntity] = []
-    try:
-        if house.get("IdADo") is None:
-            _LOGGER.warning("Skipping house without IdADo: %s", house)
-            return entities
+    if house.get("IdADo") is None:
+        _LOGGER.warning("Skipping house without IdADo: %s", house)
+        return entities
 
-        coordinator = EkartotekaCoordinator(hass, api, house)
-        # Ensure we have data before creating entities
-        await coordinator.async_config_entry_first_refresh()
+    coordinator = EkartotekaCoordinator(hass, api, house)
+    # Ensure we have data before creating entities
+    await coordinator.async_refresh()
+    if not coordinator.last_update_success:
+        raise PlatformNotReady(
+            f"Initial eKartoteka update failed for house {coordinator.house_id}"
+        ) from coordinator.last_exception
 
-        # Per-house invoice summary
-        meters_info = await hass.async_add_executor_job(api.houseAnalysisSummary, coordinator.house_id)
-        for meter in meters_info:
-            if meter.get("id_el_op", None):
-                entities.append(
-                    EkartotekaInvoiceSummarySensor(
-                        coordinator,
-                        meter.get("id_el_op"),
-                        meter.get("Nazwa", "")
-                    )
-                )
-                _LOGGER.error("test")
-                # Monthly cost per sensor
-                entities.append(
-                    EkartotekaMeterSensorCost(
-                        coordinator=coordinator,
-                        sensor_id=meter.get("id_el_op"),
-                        sensor_name=meter.get("Nazwa", ""),
-                    )
-                )
-
-        # Last invoice data per last update from coordinator
-        last_invoice = coordinator.data.get("last_invoice", {})
-        for entry_name, entry in last_invoice.items():
-            entities.append(EkartotekaRentInvoiceEntry(coordinator, entry_name, entry.get("apartment_id")))
-
-        # Per-apartment meter entities based on coordinator meta
-        meters = coordinator.data.get("meters", {})
-
-        # We need unit and names -> fetch once from houseSensorList
-        sensors = await hass.async_add_executor_job(api.houseSensorList, coordinator.house_id)
-        sensor_meta_by_id = {
-            int(s.get("id_el_op")): {
-                "group_id": s.get("id_gru"),
-                "unit": (s.get("jm") or "").strip(),
-                "name": s.get("nazwa") or str(s.get("id_el_op"))
-            }
-            for s in sensors
-            if s.get("id_el_op") is not None
-        }
-
-        for (apt_id, sensor_id), _ in meters.items():
-            meta = sensor_meta_by_id.get(int(sensor_id))
-            if not meta:
-                continue
+    # Per-house invoice summary
+    meters_info = coordinator.data.get("meters_invoice_summary", {})
+    for meter_id, meter in meters_info.items():
+        if meter_id:
             entities.append(
-                EkartotekaMeterSensor(
-                    coordinator=coordinator,
-                    apartment_id=int(apt_id),
-                    sensor_id=int(sensor_id),
-                    group_id=int(meta.get("group_id")) if meta.get("group_id") is not None else 0,
-                    unit=meta.get("unit", ""),
-                    sensor_name=meta.get("name", str(sensor_id)),
+                EkartotekaInvoiceSummarySensor(
+                    coordinator,
+                    meter_id,
+                    meter.get("Nazwa", "")
                 )
             )
-    except Exception as err:
-        _LOGGER.error(traceback.format_exc())
+            # Monthly cost per sensor
+            entities.append(
+                EkartotekaMeterSensorCost(
+                    coordinator=coordinator,
+                    sensor_id=meter_id,
+                    sensor_name=meter.get("Nazwa", ""),
+                )
+            )
+
+    # Last invoice data per last update from coordinator
+    last_invoice = coordinator.data.get("last_invoice", {})
+    for entry_name, entry in last_invoice.items():
+        entities.append(EkartotekaRentInvoiceEntry(coordinator, entry_name, entry.get("apartment_id")))
+
+    # Per-apartment meter entities based on coordinator meta
+    meters = coordinator.data.get("meters", {})
+
+    # Units and names come from the sensor list fetched by the coordinator
+    sensors = coordinator.data.get("sensors", [])
+    sensor_meta_by_id = {
+        int(s.get("id_el_op")): {
+            "group_id": s.get("id_gru"),
+            "unit": (s.get("jm") or "").strip(),
+            "name": s.get("nazwa") or str(s.get("id_el_op"))
+        }
+        for s in sensors
+        if s.get("id_el_op") is not None
+    }
+
+    for (apt_id, sensor_id), _ in meters.items():
+        meta = sensor_meta_by_id.get(int(sensor_id))
+        if not meta:
+            continue
+        entities.append(
+            EkartotekaMeterSensor(
+                coordinator=coordinator,
+                apartment_id=int(apt_id),
+                sensor_id=int(sensor_id),
+                group_id=int(meta.get("group_id")) if meta.get("group_id") is not None else 0,
+                unit=meta.get("unit", ""),
+                sensor_name=meta.get("name", str(sensor_id)),
+            )
+        )
     return entities
+
+
+async def _async_setup_houses(
+    hass: HomeAssistant, api: eKartotekaAPI, async_add_entities: Callable
+) -> None:
+    try:
+        houses = await hass.async_add_executor_job(api.houseList)
+    except eKartotekaAuthError as err:
+        # Wrong credentials won't fix themselves; don't hammer the login endpoint
+        _LOGGER.error("eKartoteka login failed: %s", err)
+        return
+    except Exception as err:
+        raise PlatformNotReady(f"Failed to fetch eKartoteka house list: {err}") from err
+
+    if not houses:
+        _LOGGER.warning("No houses returned by API")
+        return
+
+    all_entities: list[SensorEntity] = []
+    for house in houses:
+        entities = await _async_build_entities_for_house(hass, api, house)
+        all_entities.extend(entities)
+
+    if all_entities:
+        async_add_entities(all_entities)
 
 
 async def async_setup_entry(
@@ -132,25 +162,8 @@ async def async_setup_entry(
     user = config_entry.data[CONF_USERNAME]
     password = config_entry.data[CONF_PASSWORD]
     api = eKartotekaAPI(user, password)
-
-    try:
-        houses = await hass.async_add_executor_job(api.houseList)
-    except Exception as err:
-        _LOGGER.error("Failed to fetch house list: %s", err)
-        return
-
-    if not houses:
-        _LOGGER.warning("No houses returned by API")
-        return
-
-    all_entities: list[SensorEntity] = []
     _LOGGER.debug("Loading houses (config entry)")
-    for house in houses:
-        entities = await _async_build_entities_for_house(hass, api, house)
-        all_entities.extend(entities)
-
-    if all_entities:
-        async_add_entities(all_entities)
+    await _async_setup_houses(hass, api, async_add_entities)
 
 
 async def async_setup_platform(
@@ -160,23 +173,5 @@ async def async_setup_platform(
     discovery_info: Optional[DiscoveryInfoType] = None,
 ) -> None:
     api = eKartotekaAPI(config.get(CONF_USERNAME), config.get(CONF_PASSWORD))
-
-    try:
-        houses = await hass.async_add_executor_job(api.houseList)
-    except Exception as err:
-        _LOGGER.error("Failed to fetch house list: %s", err)
-        return
-
-    if not houses:
-        _LOGGER.warning("No houses returned by API")
-        return
-
-    all_entities: list[SensorEntity] = []
     _LOGGER.debug("Loading houses")
-    for house in houses:
-        entities = await _async_build_entities_for_house(hass, api, house)
-        all_entities.extend(entities)
-
-    if all_entities:
-        async_add_entities(all_entities)
-
+    await _async_setup_houses(hass, api, async_add_entities)
